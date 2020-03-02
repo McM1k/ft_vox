@@ -1,11 +1,26 @@
+use vulkano::buffer::{BufferUsage, CpuAccessibleBuffer};
+use vulkano::command_buffer::{AutoCommandBufferBuilder, DynamicState};
+use vulkano::device::{Device, DeviceExtensions};
+use vulkano::framebuffer::{Framebuffer, FramebufferAbstract, Subpass, RenderPassAbstract};
+use vulkano::image::SwapchainImage;
 use vulkano::instance::{Instance, PhysicalDevice};
+use vulkano::pipeline::GraphicsPipeline;
+use vulkano::pipeline::viewport::Viewport;
+use vulkano::swapchain::{AcquireError, PresentMode, SurfaceTransform, Swapchain, SwapchainCreationError};
+use vulkano::swapchain;
+use vulkano::swapchain::{FullscreenExclusive, ColorSpace};
+use vulkano::sync::{GpuFuture, FlushError};
+use vulkano::sync;
 
 use vulkano_win::VkSurfaceBuild;
-use winit::window::WindowBuilder;
-use vulkano::device::{DeviceExtensions, Device};
-use vulkano::swapchain::{Swapchain, SurfaceTransform, PresentMode, ColorSpace, FullscreenExclusive};
-use std::intrinsics::atomic_and;
-use vulkano::buffer::{CpuAccessibleBuffer, BufferUsage};
+
+use winit::window::{WindowBuilder, Window};
+use winit::event_loop::EventLoop;
+use winit::event::{Event, WindowEvent};
+
+use std::sync::Arc;
+use vulkano::descriptor::pipeline_layout::PipelineLayoutDesc;
+
 
 fn main() {
     let instance = {
@@ -16,7 +31,7 @@ fn main() {
     let physical = PhysicalDevice::enumerate(&instance).next().unwrap();
     println!("Using device: {} (type: {:?})", physical.name(), physical.ty());
 
-    let mut events_loop = EventsLoop::new();
+    let mut events_loop = EventLoop::new();
     let surface = WindowBuilder::new().build_vk_surface(&events_loop, instance.clone()).unwrap();
     let window = surface.window();
 
@@ -34,11 +49,10 @@ fn main() {
         let usage = caps.supported_usage_flags;
         let alpha = caps.supported_composite_alpha.iter().next().unwrap();
         let format = caps.supported_formats[0].0;
-        let initial_dimensions = if let Some(dimensions) = window.get_inner_size() {
-            let dimensions: (u32, u32) = dimensions.to_physical(window.get_hidpi_factor()).into();
-            [dimensions.0, dimensions.1]
-        } else {
-            return;
+        let initial_dimensions = {
+            let dimensions= window.inner_size();
+            let scale_factor = window.scale_factor();
+            [(dimensions.width as f64 * scale_factor) as u32, (dimensions.height as f64 * scale_factor) as u32]
         };
 
         Swapchain::new(device.clone(), surface.clone(), caps.min_image_count, format,
@@ -58,7 +72,41 @@ fn main() {
         ].iter().cloned()).unwrap()
     };
 
+    let render_pass = Arc::new(vulkano::single_pass_renderpass!(
+        device.clone(),
+        Attachments: {
+            color: {
+                load: Clear,
+                store: Store,
+                format: swapchain.format(),
+                samples: 1,
+            }
+        },
+        pass: {
+            color: [color],
+            depth_stencil: {},
+        }
+    ).unwrap());
 
+    let pipeline = Arc::new(GraphicsPipeline::start()
+        .vertex_input_single_buffer()
+        .triangle_list()
+        .viewports_dynamic_scissors_irrelevant(1)
+        .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
+        .build(device.clone())
+        .unwrap());
+    let mut dynamic_state = DynamicState {
+        line_width: None,
+        viewports: None,
+        scissors: None,
+        compare_mask: None,
+        write_mask: None,
+        reference: None
+    };
+    let mut framebuffers = window_size_dependent_setup(&images, render_pass.clone(), &mut dynamic_state);
+
+    
+    
 }
 
 
