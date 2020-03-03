@@ -9,7 +9,7 @@ use vulkano::pipeline::viewport::Viewport;
 use vulkano::swapchain::{AcquireError, PresentMode, SurfaceTransform, Swapchain, SwapchainCreationError};
 use vulkano::swapchain;
 use vulkano::swapchain::{FullscreenExclusive, ColorSpace};
-use vulkano::sync::{GpuFuture, FlushError};
+use vulkano::sync::{FlushError, GpuFuture};
 use vulkano::sync;
 
 use vulkano_win::VkSurfaceBuild;
@@ -49,11 +49,7 @@ fn main() {
         let usage = caps.supported_usage_flags;
         let alpha = caps.supported_composite_alpha.iter().next().unwrap();
         let format = caps.supported_formats[0].0;
-        let initial_dimensions = {
-            let dimensions= window.inner_size();
-            let scale_factor = window.scale_factor();
-            [(dimensions.width as f64 * scale_factor) as u32, (dimensions.height as f64 * scale_factor) as u32]
-        };
+        let initial_dimensions = get_swapchain_dimensions(window);
 
         Swapchain::new(device.clone(), surface.clone(), caps.min_image_count, format,
             initial_dimensions, 1, usage, &queue, SurfaceTransform::Identity, alpha,
@@ -72,9 +68,36 @@ fn main() {
         ].iter().cloned()).unwrap()
     };
 
+    mod vs {
+        vulkano_shaders::shader!{
+            ty: "vertex",
+            src: "
+#version 450
+layout(location = 0) in vec2 position;
+void main() {
+    gl_Position = vec4(position, 0.0, 1.0);
+}"
+        }
+    }
+
+    mod fs {
+        vulkano_shaders::shader!{
+            ty: "fragment",
+            src: "
+#version 450
+layout(location = 0) out vec4 f_color;
+void main() {
+    f_color = vec4(1.0, 0.0, 0.0, 1.0);
+}
+"
+        }
+    }
+    let vs = vs::Shader::load(device.clone()).unwrap();
+    let fs = fs::Shader::load(device.clone()).unwrap();
+
     let render_pass = Arc::new(vulkano::single_pass_renderpass!(
         device.clone(),
-        Attachments: {
+        attachments: {
             color: {
                 load: Clear,
                 store: Store,
@@ -84,14 +107,16 @@ fn main() {
         },
         pass: {
             color: [color],
-            depth_stencil: {},
+            depth_stencil: {}
         }
     ).unwrap());
 
     let pipeline = Arc::new(GraphicsPipeline::start()
         .vertex_input_single_buffer()
+        .vertex_shader(vs.main_entry_point(), ())
         .triangle_list()
         .viewports_dynamic_scissors_irrelevant(1)
+        .fragment_shader(fs.main_entry_point(), ())
         .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
         .build(device.clone())
         .unwrap());
@@ -104,9 +129,94 @@ fn main() {
         reference: None
     };
     let mut framebuffers = window_size_dependent_setup(&images, render_pass.clone(), &mut dynamic_state);
+    let mut recreate_swapchain = false;
+    let mut previous_frame_end = Box::new(sync::now(device.clone())) as Box<dyn GpuFuture>;
 
-    
+    loop {
+        previous_frame_end.cleanup_finished();
+        if recreate_swapchain {
+            let dimensions = get_swapchain_dimensions(window);
+            let (new_swapchain, new_images) = match swapchain.recreate_with_dimensions(dimensions) {
+                Ok(r) => r,
+                Err(SwapchainCreationError::UnsupportedDimensions) => continue,
+                Err(e) => panic!("{:?}", e),
+            };
+
+            swapchain = new_swapchain;
+            framebuffers = window_size_dependent_setup(&new_images, render_pass.clone(), &mut dynamic_state);
+            recreate_swapchain = false;
+        }
+
+        let (image_num, _b, acquire_future) = match swapchain::acquire_next_image(swapchain.clone(), None) {
+            Ok(r) => r,
+            Err(AcquireError::OutOfDate) => {
+                recreate_swapchain = true;
+                continue;
+            },
+            Err(e) => panic!("{:?}", e),
+        };
+
+        let clear_values = vec!([0.0, 0.0, 1.0, 1.0].into());
+        let command_buffer = AutoCommandBufferBuilder::primary_one_time_submit(device.clone(), queue.family()).unwrap()
+            .begin_render_pass(framebuffers[image_num].clone(), false, clear_values).unwrap()
+            .draw(pipeline.clone(), &dynamic_state, vertex_buffer.clone(), (), ()).unwrap()
+            .end_render_pass().unwrap()
+            .build().unwrap();
+        let future = previous_frame_end
+            .join(acquire_future)
+            .then_execute(queue.clone(), command_buffer).unwrap()
+            .then_swapchain_present(queue.clone(), swapchain.clone(), image_num)
+            .then_signal_fence_and_flush();
+        match future {
+            Ok(future) => { previous_frame_end = Box::new(future) as Box::<_>; },
+            Err(FlushError::OutOfDate) => {
+                recreate_swapchain = true;
+                previous_frame_end = Box::new(sync::now(device.clone())) as Box::<_>;
+            },
+            Err(e) => {
+                println!("{:?}", e);
+                previous_frame_end = Box::new(sync::now(device.clone())) as Box::<_>;
+            }
+        }
+
+        let mut done = false;
+        events_loop.poll_events(|ev| {
+           match ev {
+               Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => done = true,
+               Event::WindowEvent { event: WindowEvent::Resized(_), .. } => recreate_swapchain = true,
+               _ => (),
+           }
+        });
+        if done { return; }
+    }
     
 }
 
+pub fn window_size_dependent_setup(
+    images: &[Arc<SwapchainImage<Window>>],
+    render_pass: Arc<dyn RenderPassAbstract + Send + Sync>,
+    dynamic_state: &mut DynamicState,
+) -> Vec<Arc<dyn FramebufferAbstract + Send + Sync>> {
+    let dimensions = images[0].dimensions();
+    let viewport = Viewport {
+        origin: [0.0, 0.0],
+        dimensions: [dimensions[0] as f32, dimensions[1] as f32],
+        depth_range: 0.0 .. 1.0,
+    };
+    dynamic_state.viewports = Some(vec!(viewport));
+
+    images.iter().map(|image| {
+        Arc::new(
+            Framebuffer::start(render_pass.clone())
+                .add(image.clone()).unwrap()
+                .build().unwrap()
+        ) as Arc<dyn FramebufferAbstract + Send + Sync>
+    }).collect::<Vec<_>>()
+}
+
+pub fn get_swapchain_dimensions(window: &Window) -> [u32; 2] {
+    let dimensions = window.inner_size();
+    let scale_factor = window.scale_factor();
+    [(dimensions.width as f64 * scale_factor) as u32, (dimensions.height as f64 * scale_factor) as u32]
+}
 
